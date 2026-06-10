@@ -1,0 +1,4 @@
+*.log
+*.state
+*.tmp
+fan-boost-ui.config.json
