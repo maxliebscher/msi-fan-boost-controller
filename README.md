@@ -26,6 +26,7 @@ This project calls MSI Center's internal .NET APIs to switch fan modes. Those AP
 - Default cycle: **60 seconds boost**, then **840 seconds pause**.
 - Shows status, process ID, boost/pause duration, cycle length, fan speed, and a live log.
 - Lets you change boost and pause duration from the terminal UI.
+- Logs UI commands such as Start, Stop, Refresh, and configuration changes.
 - Stops the worker when you choose `Exit`.
 - The hidden worker also exits when the UI process disappears.
 
@@ -75,6 +76,7 @@ The scripts create local runtime files inside `scripts/`:
 - `fan-boost-ui.config.json`
 - `msi-fanboost-cycle.log`
 - `msi-fanboost-cycle.state`
+- `msi-fanboost-cycle.stop`
 
 These files are ignored by Git.
 

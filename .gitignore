@@ -7,3 +7,4 @@ Desktop.ini
 scripts/fan-boost-ui.config.json
 scripts/msi-fanboost-cycle.log
 scripts/msi-fanboost-cycle.state
+scripts/msi-fanboost-cycle.stop

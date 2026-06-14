@@ -10,6 +10,7 @@ $boostMode = 2
 $normalMode = 0
 $statePath = Join-Path $PSScriptRoot "msi-fanboost-cycle.state"
 $logPath = Join-Path $PSScriptRoot "msi-fanboost-cycle.log"
+$stopSignalPath = Join-Path $PSScriptRoot "msi-fanboost-cycle.stop"
 
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 $OutputEncoding = New-Object System.Text.UTF8Encoding($false)
@@ -44,7 +45,20 @@ function Update-State([string]$status, [bool]$running = $false) {
             Running = $running
             LastFanSpeed = $script:LastFanSpeed
         }
-        $payload | ConvertTo-Json -Compress | Set-Content -LiteralPath $statePath -Encoding UTF8
+        $json = $payload | ConvertTo-Json -Compress
+        $stream = [System.IO.File]::Open($statePath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
+        try {
+            $writer = New-Object System.IO.StreamWriter($stream, (New-Object System.Text.UTF8Encoding($false)))
+            try {
+                $writer.Write($json)
+            }
+            finally {
+                $writer.Dispose()
+            }
+        }
+        finally {
+            $stream.Dispose()
+        }
     }
     catch {}
 }
@@ -61,6 +75,10 @@ function Test-ParentAlive {
     catch {
         return $false
     }
+}
+
+function Test-StopSignal {
+    return (Test-Path -LiteralPath $stopSignalPath)
 }
 
 function Invoke-QuietMsiApi([scriptblock]$Action) {
@@ -170,6 +188,11 @@ function Warmup-FanApi {
 
     Write-Status "MSI fan API warmup: mode 4,5,6,0,1 with short waits."
     foreach ($mode in @(4, 5, 6, 0, 1)) {
+        if (Test-StopSignal) {
+            Write-Status "Stop signal received during warmup."
+            $script:StopRequested = $true
+            return
+        }
         if (-not (Test-ParentAlive)) {
             $script:StopRequested = $true
             return
@@ -199,6 +222,12 @@ function Wait-WithCommands($seconds, [string]$label) {
     $deadline = (Get-Date).AddSeconds($seconds)
 
     while ((Get-Date) -lt $deadline) {
+        if (Test-StopSignal) {
+            Write-Status "Stop signal received."
+            $script:StopRequested = $true
+            return "quit"
+        }
+
         if (-not (Test-ParentAlive)) {
             Write-Status "Parent UI process is gone; stopping worker."
             $script:StopRequested = $true
@@ -300,4 +329,5 @@ finally {
     catch {}
     Update-State -status "stopped" -running $false
     try { Remove-Item -LiteralPath $statePath -ErrorAction SilentlyContinue } catch {}
+    try { Remove-Item -LiteralPath $stopSignalPath -ErrorAction SilentlyContinue } catch {}
 }

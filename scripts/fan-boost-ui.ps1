@@ -6,6 +6,7 @@ $baseDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $coreScript = Join-Path $baseDir "msi-fanboost-cycle.ps1"
 $statePath = Join-Path $baseDir "msi-fanboost-cycle.state"
 $logPath = Join-Path $baseDir "msi-fanboost-cycle.log"
+$stopSignalPath = Join-Path $baseDir "msi-fanboost-cycle.stop"
 $configPath = Join-Path $baseDir "fan-boost-ui.config.json"
 
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
@@ -43,14 +44,43 @@ function Save-Config($boost, $pause) {
     try { $cfg | ConvertTo-Json | Set-Content -Path $configPath -Encoding UTF8 } catch {}
 }
 
+function Write-UiLog($message) {
+    try {
+        $line = (Get-Date).ToString("HH:mm:ss") + " UI: " + $message
+        Add-Content -LiteralPath $logPath -Value $line -Encoding UTF8
+    }
+    catch {}
+}
+
 function Get-State {
     if (-not (Test-Path $statePath)) { return $null }
-    try {
-        return Get-Content -Path $statePath -Raw | ConvertFrom-Json
+
+    for ($attempt = 0; $attempt -lt 5; $attempt++) {
+        try {
+            $stream = [System.IO.File]::Open($statePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+            try {
+                $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8)
+                try {
+                    $json = $reader.ReadToEnd()
+                }
+                finally {
+                    $reader.Dispose()
+                }
+            }
+            finally {
+                $stream.Dispose()
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace($json)) {
+                return $json | ConvertFrom-Json
+            }
+        }
+        catch {
+            Start-Sleep -Milliseconds 50
+        }
     }
-    catch {
-        return $null
-    }
+
+    return $null
 }
 
 function Format-StateLine($state) {
@@ -213,11 +243,15 @@ function Flash-StatusLine([string]$message) {
 }
 
 function Start-FanCycle($boost, $pause) {
+    Write-UiLog ("Start requested ({0}s boost / {1}s pause)." -f $boost, $pause)
+
     if ($pause -lt 1) {
+        Write-UiLog "Start rejected: pause must be at least 1 second."
         return "Pause must be at least 1 second."
     }
 
     if (-not (Test-Path -LiteralPath $coreScript)) {
+        Write-UiLog ("Start rejected: worker script not found at {0}" -f $coreScript)
         return "Worker script not found: $coreScript"
     }
 
@@ -226,11 +260,14 @@ function Start-FanCycle($boost, $pause) {
         try {
             $proc = Get-Process -Id $state.ProcessId -ErrorAction SilentlyContinue
             if ($proc) {
+                Write-UiLog ("Start skipped: already running (PID {0})." -f $state.ProcessId)
                 return ("Already running (PID {0})." -f $state.ProcessId)
             }
         }
         catch {}
     }
+
+    Remove-Item -LiteralPath $stopSignalPath -ErrorAction SilentlyContinue
 
     $cycleSeconds = $boost + $pause
     $args = @(
@@ -249,23 +286,55 @@ function Start-FanCycle($boost, $pause) {
     $proc = Start-Process powershell -ArgumentList $args -Verb RunAs -WindowStyle Hidden -PassThru
     Start-Sleep -Milliseconds 800
     if ($proc -and $proc.Id) {
+        Write-UiLog ("Worker launched (PID {0})." -f $proc.Id)
         return ("Started (PID {0})." -f $proc.Id)
     }
+    Write-UiLog "Worker launch requested; waiting for UAC."
     return "Start requested (UAC may still block)."
 }
 
 function Stop-FanCycle {
+    param([bool]$Silent = $false)
+
+    if (-not $Silent) {
+        Write-UiLog "Stop requested."
+    }
+
     $state = Get-State
     if ($null -eq $state -or -not $state.ProcessId) {
+        if (-not $Silent) {
+            Write-UiLog "Stop skipped: no known running process."
+        }
         return "No known running process."
     }
 
     try {
+        Set-Content -LiteralPath $stopSignalPath -Value "stop" -Encoding ASCII
+        for ($attempt = 0; $attempt -lt 20; $attempt++) {
+            $proc = Get-Process -Id $state.ProcessId -ErrorAction SilentlyContinue
+            if ($null -eq $proc) {
+                Remove-Item -LiteralPath $statePath -ErrorAction SilentlyContinue
+                Remove-Item -LiteralPath $stopSignalPath -ErrorAction SilentlyContinue
+                if (-not $Silent) {
+                    Write-UiLog ("Worker stopped gracefully (PID {0})." -f $state.ProcessId)
+                }
+                return ("Process {0} stopped." -f $state.ProcessId)
+            }
+            Start-Sleep -Milliseconds 250
+        }
+
         Stop-Process -Id $state.ProcessId -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $statePath -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $stopSignalPath -ErrorAction SilentlyContinue
+        if (-not $Silent) {
+            Write-UiLog ("Worker forced to stop (PID {0})." -f $state.ProcessId)
+        }
         return ("Process {0} stopped." -f $state.ProcessId)
     }
     catch {
+        if (-not $Silent) {
+            Write-UiLog ("Stop failed: {0}" -f $_.Exception.Message)
+        }
         return ("Stop failed: {0}" -f $_.Exception.Message)
     }
 }
@@ -315,14 +384,17 @@ try {
                 $message = Stop-FanCycle
             }
             "3" {
+                Write-UiLog "Refresh requested."
                 $message = "Status refreshed."
             }
             "4" {
                 $new = Read-Host "New boost time in seconds"
                 if ([int]::TryParse($new, [ref]$global:boostSeconds) -and $global:boostSeconds -gt 0) {
                     Save-Config $global:boostSeconds $global:pauseSeconds
+                    Write-UiLog ("Boost time changed to {0}s." -f $global:boostSeconds)
                     $message = ("New boost time: {0} s" -f $global:boostSeconds)
                 } else {
+                    Write-UiLog ("Invalid boost time input: {0}" -f $new)
                     $message = "Invalid number for boost."
                 }
             }
@@ -330,12 +402,15 @@ try {
                 $new = Read-Host "New pause time in seconds"
                 if ([int]::TryParse($new, [ref]$global:pauseSeconds) -and $global:pauseSeconds -gt 0) {
                     Save-Config $global:boostSeconds $global:pauseSeconds
+                    Write-UiLog ("Pause time changed to {0}s." -f $global:pauseSeconds)
                     $message = ("New pause time: {0} s" -f $global:pauseSeconds)
                 } else {
+                    Write-UiLog ("Invalid pause time input: {0}" -f $new)
                     $message = "Invalid number for pause."
                 }
             }
             "6" {
+                Write-UiLog "Exit requested."
                 [void](Stop-FanCycle)
                 return
             }
@@ -346,5 +421,5 @@ try {
     }
 }
 finally {
-    [void](Stop-FanCycle)
+    [void](Stop-FanCycle -Silent $true)
 }
