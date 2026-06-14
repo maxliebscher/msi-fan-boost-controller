@@ -1,9 +1,9 @@
 @echo off
-REM Start the MSI Fan Boost Controller terminal UI
+REM Convenience launcher for users who download the repository as a ZIP.
 setlocal
 set "SCRIPT_DIR=%~dp0"
+set "UI_SCRIPT=%SCRIPT_DIR%scripts\fan-boost-ui.ps1"
 set "PS_EXE=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
-set "UI_SCRIPT=%SCRIPT_DIR%fan-boost-ui.ps1"
 
 if not exist "%UI_SCRIPT%" (
     echo %UI_SCRIPT% not found.

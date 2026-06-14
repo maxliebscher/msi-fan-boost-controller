@@ -1,5 +1,5 @@
 @echo off
-REM Start the MSI Fan Boost Controller terminal UI
+REM Start the colorful terminal UI in English
 setlocal
 set "SCRIPT_DIR=%~dp0"
 set "PS_EXE=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
@@ -11,4 +11,4 @@ if not exist "%UI_SCRIPT%" (
     exit /b 1
 )
 
-"%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -File "%UI_SCRIPT%"
+"%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -File "%UI_SCRIPT%" -Language en-US

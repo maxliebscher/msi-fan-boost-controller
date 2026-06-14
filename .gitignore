@@ -1,4 +1,9 @@
 *.log
 *.state
 *.tmp
-fan-boost-ui.config.json
+*.lnk
+Thumbs.db
+Desktop.ini
+scripts/fan-boost-ui.config.json
+scripts/msi-fanboost-cycle.log
+scripts/msi-fanboost-cycle.state

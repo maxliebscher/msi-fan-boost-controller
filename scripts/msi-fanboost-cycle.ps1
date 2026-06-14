@@ -1,6 +1,7 @@
-param(
+﻿param(
     [int]$BoostSeconds = 60,
-    [int]$CycleSeconds = 900
+    [int]$CycleSeconds = 900,
+    [int]$ParentProcessId = 0
 )
 
 $ErrorActionPreference = "Continue"
@@ -9,14 +10,20 @@ $boostMode = 2
 $normalMode = 0
 $statePath = Join-Path $PSScriptRoot "msi-fanboost-cycle.state"
 $logPath = Join-Path $PSScriptRoot "msi-fanboost-cycle.log"
+
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 $OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 
 $boostSeconds = [Math]::Max(1, $BoostSeconds)
 $cycleSeconds = [Math]::Max([Math]::Max(1, $BoostSeconds + 1), $CycleSeconds)
 $pauseSeconds = $cycleSeconds - $boostSeconds
-$script:LastFanSpeed = "<noch nicht gemessen>"
+
+$script:LastFanSpeed = "<not measured yet>"
 $script:NextFanSample = [DateTime]::MinValue
+$script:Paused = $false
+$script:StopRequested = $false
+$script:FanApiWarmed = $false
+$script:ScenarioType = $null
 
 function Write-Status($message) {
     $line = (Get-Date).ToString("HH:mm:ss") + " " + $message
@@ -33,6 +40,7 @@ function Update-State([string]$status, [bool]$running = $false) {
             CycleSeconds = $cycleSeconds
             PauseSeconds = $pauseSeconds
             ProcessId = $PID
+            ParentProcessId = $ParentProcessId
             Running = $running
             LastFanSpeed = $script:LastFanSpeed
         }
@@ -41,39 +49,94 @@ function Update-State([string]$status, [bool]$running = $false) {
     catch {}
 }
 
+function Test-ParentAlive {
+    if ($ParentProcessId -le 0) {
+        return $true
+    }
+
+    try {
+        $parent = Get-Process -Id $ParentProcessId -ErrorAction SilentlyContinue
+        return ($null -ne $parent)
+    }
+    catch {
+        return $false
+    }
+}
+
+function Invoke-QuietMsiApi([scriptblock]$Action) {
+    $oldOut = [Console]::Out
+    $oldErr = [Console]::Error
+    $sinkOut = New-Object System.IO.StringWriter
+    $sinkErr = New-Object System.IO.StringWriter
+
+    try {
+        [Console]::SetOut($sinkOut)
+        [Console]::SetError($sinkErr)
+        return & $Action
+    }
+    finally {
+        [Console]::SetOut($oldOut)
+        [Console]::SetError($oldErr)
+        $noise = ($sinkOut.ToString() + $sinkErr.ToString()).Trim()
+        if ($noise) {
+            Add-Content -LiteralPath $logPath -Value ((Get-Date).ToString("HH:mm:ss") + " MSI API console output suppressed.") -Encoding UTF8
+        }
+        $sinkOut.Dispose()
+        $sinkErr.Dispose()
+    }
+}
+
 function Load-MsiApi {
     $base = "C:\Program Files (x86)\MSI\MSI Center"
+    $moduleDll = Join-Path $base "Base Module\API_NB_Base Module.dll"
+
+    if (-not (Test-Path -LiteralPath $base)) {
+        throw "MSI Center was not found at: $base"
+    }
+    if (-not (Test-Path -LiteralPath $moduleDll)) {
+        throw "MSI Center Base Module API was not found at: $moduleDll"
+    }
+
     [Environment]::CurrentDirectory = $base
 
     Get-ChildItem $base -File -Filter "*.dll" | ForEach-Object {
         try { [Reflection.Assembly]::LoadFrom($_.FullName) | Out-Null } catch {}
     }
 
-    $asm = [Reflection.Assembly]::LoadFrom((Join-Path $base "Base Module\API_NB_Base Module.dll"))
+    $asm = [Reflection.Assembly]::LoadFrom($moduleDll)
     $pluginType = $asm.GetType("API_Base_Module.PluginClass")
+    if ($null -eq $pluginType) {
+        throw "MSI API type API_Base_Module.PluginClass was not found."
+    }
+
     try {
         $plugin = [Activator]::CreateInstance($pluginType)
-        [void]$pluginType.GetMethod("MainEntry").Invoke($plugin, @())
+        [void](Invoke-QuietMsiApi { $pluginType.GetMethod("MainEntry").Invoke($plugin, @()) })
     }
     catch {
-        Write-Status ("MainEntry Hinweis: " + $_.Exception.Message)
+        Write-Status ("MainEntry notice: " + $_.Exception.Message)
         if ($_.Exception.InnerException) {
-            Write-Status ("MainEntry Detail: " + $_.Exception.InnerException.Message)
+            Write-Status ("MainEntry detail: " + $_.Exception.InnerException.Message)
         }
     }
-    return $asm.GetType("API_Base_Module.UserScenario")
+
+    $scenarioType = $asm.GetType("API_Base_Module.UserScenario")
+    if ($null -eq $scenarioType) {
+        throw "MSI API type API_Base_Module.UserScenario was not found."
+    }
+    return $scenarioType
 }
 
 function Set-FanMode($mode) {
     try {
-        [void]$script:ScenarioType.GetMethod("setFan").Invoke($null, @([int]$mode, [bool]$true))
-        Write-Status "Fanmode $mode gesetzt."
+        [void](Invoke-QuietMsiApi { $script:ScenarioType.GetMethod("setFan").Invoke($null, @([int]$mode, [bool]$true)) })
+        Write-Status ("Fan mode {0} set." -f $mode)
         return $true
     }
     catch {
-        Write-Status ("Fanmode-Fehler " + $mode + ": " + $_.Exception.Message)
+        Write-Status ("Fan mode error {0}: {1}" -f $mode, $_.Exception.Message)
         if ($_.Exception.InnerException) {
-            Write-Status ("Fanmode-Detail " + $mode + ": " + $_.Exception.InnerException.Message)
+            Write-Status ("Fan mode detail {0}: {1}" -f $mode, $_.Exception.InnerException.Message)
         }
         return $false
     }
@@ -81,9 +144,9 @@ function Set-FanMode($mode) {
 
 function Get-FanSpeedText {
     try {
-        $value = $script:ScenarioType.GetMethod("GetFanSpeed").Invoke($null, @())
+        $value = Invoke-QuietMsiApi { $script:ScenarioType.GetMethod("GetFanSpeed").Invoke($null, @()) }
         if ($null -eq $value) {
-            return "<leer>"
+            return "<empty>"
         }
         return [string]$value
     }
@@ -105,11 +168,15 @@ function Warmup-FanApi {
         return
     }
 
-    Write-Status "MSI Fan-API Warmup: mode 4,5,6,0,1 mit kurzen Wartezeiten."
+    Write-Status "MSI fan API warmup: mode 4,5,6,0,1 with short waits."
     foreach ($mode in @(4, 5, 6, 0, 1)) {
+        if (-not (Test-ParentAlive)) {
+            $script:StopRequested = $true
+            return
+        }
         [void](Set-FanMode $mode)
         Start-Sleep -Seconds 8
-        Write-Status ("Warmup RPM nach mode " + $mode + ": " + (Get-FanSpeedText))
+        Write-Status ("Warmup RPM after mode {0}: {1}" -f $mode, (Get-FanSpeedText))
     }
     $script:FanApiWarmed = $true
 }
@@ -130,7 +197,14 @@ function Read-CommandNonBlocking {
 function Wait-WithCommands($seconds, [string]$label) {
     $script:NextFanSample = (Get-Date).AddSeconds(1)
     $deadline = (Get-Date).AddSeconds($seconds)
+
     while ((Get-Date) -lt $deadline) {
+        if (-not (Test-ParentAlive)) {
+            Write-Status "Parent UI process is gone; stopping worker."
+            $script:StopRequested = $true
+            return "quit"
+        }
+
         if ((Get-Date) -ge $script:NextFanSample) {
             Refresh-FanSpeed
             $script:NextFanSample = (Get-Date).AddSeconds(5)
@@ -142,19 +216,19 @@ function Wait-WithCommands($seconds, [string]$label) {
                 "pause" {
                     $script:Paused = $true
                     [void](Set-FanMode $normalMode)
-                    Write-Status "PAUSE: Fanmode $normalMode gesetzt."
+                    Write-Status ("PAUSE: fan mode {0} set." -f $normalMode)
                     return "pause"
                 }
                 "start" {
                     $script:Paused = $false
-                    Write-Status "START: Zyklus aktiv."
+                    Write-Status "START: cycle active."
                 }
                 "status" {
                     $state = $label
                     if ($script:Paused) {
-                        $state = "pausiert"
+                        $state = "paused"
                     }
-                    Write-Status ("STATUS: " + $state + " | FanSpeed: " + $script:LastFanSpeed)
+                    Write-Status ("STATUS: {0} | Fan speed: {1}" -f $state, $script:LastFanSpeed)
                 }
                 "quit" {
                     $script:StopRequested = $true
@@ -165,7 +239,7 @@ function Wait-WithCommands($seconds, [string]$label) {
                     return "quit"
                 }
                 default {
-                    Write-Status "Befehle: pause, start, status, quit"
+                    Write-Status "Commands: pause, start, status, quit"
                 }
             }
         }
@@ -175,50 +249,55 @@ function Wait-WithCommands($seconds, [string]$label) {
 }
 
 Set-Content -LiteralPath $logPath -Value ("MSI FanBoost Cycle Start " + (Get-Date).ToString("s")) -Encoding UTF8
-
-$script:Paused = $false
-$script:StopRequested = $false
-$script:FanApiWarmed = $false
-$script:ScenarioType = Load-MsiApi
-
-Write-Host ""
-Write-Host "MSI FanBoost Cycle"
-Write-Host "Befehle im Fenster: pause, start, status, quit"
-Write-Host "Zyklus: $boostSeconds Sekunden Boost, dann $pauseSeconds Sekunden Pause; Wiederholung alle $cycleSeconds Sekunden."
-Write-Host "Fenster schließen beendet den Lauf. Beim Beenden wird Fanmode $normalMode gesetzt."
-Write-Host ""
-
-Update-State -status "running" -running $true
+Update-State -status "starting" -running $true
 
 try {
+    $script:ScenarioType = Load-MsiApi
+
+    Write-Host ""
+    Write-Host "MSI FanBoost Cycle"
+    Write-Host "Commands in this window: pause, start, status, quit"
+    Write-Host ("Cycle: {0} seconds boost, then {1} seconds pause; repeats every {2} seconds." -f $boostSeconds, $pauseSeconds, $cycleSeconds)
+    Write-Host ("Closing the UI ends the run. On exit, fan mode {0} is set." -f $normalMode)
+    Write-Host ""
+
+    Update-State -status "running" -running $true
     Warmup-FanApi
 
     while (-not $script:StopRequested) {
         if ($script:Paused) {
-            $result = Wait-WithCommands 1 "pausiert"
+            $result = Wait-WithCommands 1 "paused"
             if ($result -eq "quit") { break }
             continue
         }
 
         Refresh-FanSpeed
-        Write-Status ("BOOST AN: Fanmode " + $boostMode + " für " + $boostSeconds + " Sekunden. FanSpeed: " + $script:LastFanSpeed)
+        Write-Status ("BOOST ON: fan mode {0} for {1} seconds. Fan speed: {2}" -f $boostMode, $boostSeconds, $script:LastFanSpeed)
         [void](Set-FanMode $boostMode)
-        $result = Wait-WithCommands $boostSeconds "Boost läuft"
+        $result = Wait-WithCommands $boostSeconds "boost running"
         if ($result -eq "quit") { break }
         if ($result -eq "pause") { continue }
 
         Refresh-FanSpeed
-        Write-Status ("BOOST AUS: Fanmode " + $normalMode + ". FanSpeed: " + $script:LastFanSpeed)
+        Write-Status ("BOOST OFF: fan mode {0}. Fan speed: {1}" -f $normalMode, $script:LastFanSpeed)
         [void](Set-FanMode $normalMode)
 
-        Write-Status "Warte $pauseSeconds Sekunden bis zum nächsten Boost."
-        $result = Wait-WithCommands $pauseSeconds "wartet"
+        Write-Status ("Waiting {0} seconds until the next boost." -f $pauseSeconds)
+        $result = Wait-WithCommands $pauseSeconds "waiting"
         if ($result -eq "quit") { break }
     }
 }
+catch {
+    Write-Status ("FATAL: " + $_.Exception.Message)
+}
 finally {
-    Write-Status "Beende: Fanmode $normalMode wird gesetzt."
-    try { [void](Set-FanMode $normalMode) } catch {}
+    Write-Status ("Exiting: fan mode {0} will be set." -f $normalMode)
+    try {
+        if ($null -ne $script:ScenarioType) {
+            [void](Set-FanMode $normalMode)
+        }
+    }
+    catch {}
     Update-State -status "stopped" -running $false
     try { Remove-Item -LiteralPath $statePath -ErrorAction SilentlyContinue } catch {}
 }
