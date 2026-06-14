@@ -2,6 +2,7 @@
 *.state
 *.tmp
 *.lnk
+dist/
 Thumbs.db
 Desktop.ini
 scripts/fan-boost-ui.config.json
